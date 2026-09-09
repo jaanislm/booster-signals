@@ -1,48 +1,42 @@
-# ============================================================
-# BOOSTER SIGNALS API V2.0
-# Scanner multiativos + Supabase
-# ============================================================
+from __future__ import annotations
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from scanner import (
+    scan_market,
+    register_cooldown,
+)
 from database import save_signal
-from scanner import scan_market
 
 
-# ============================================================
-# CONFIGURAÇÕES
-# ============================================================
+# =========================================================
+# BOOSTER API V2.1
+# =========================================================
+
+API_VERSION = "2.1.0"
+ENGINE_VERSION = "1.2.0"
 
 TZ = ZoneInfo("America/Sao_Paulo")
 
-ENGINE_VERSION = "1.0.0"
-API_VERSION = "2.0.0"
-
-# Por enquanto:
-# A e A+ = expiração de 10 minutos
 EXPIRY_MINUTES = 10
 
 
-# ============================================================
-# FASTAPI
-# ============================================================
-
 app = FastAPI(
     title="Booster Signals API",
-    description="API do motor Booster Signals multiativos",
-    version=API_VERSION
+    version=API_VERSION,
 )
 
 
-# ============================================================
+# =========================================================
 # CORS
-# Desenvolvimento apenas.
-# Depois restringiremos ao domínio do app.
-# ============================================================
+# DEV: liberado
+# Depois restringimos ao domínio do Lovable.
+# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,212 +47,409 @@ app.add_middleware(
 )
 
 
-# ============================================================
+# =========================================================
 # HELPERS
-# ============================================================
+# =========================================================
 
-def now_sp():
-    return datetime.now(TZ)
+def next_full_minute() -> datetime:
 
-
-def next_entry_time():
-    """
-    Define a entrada para o próximo minuto cheio.
-    Exemplo:
-    14:32:27 -> entrada 14:33:00
-    """
-
-    now = now_sp()
+    now = datetime.now(TZ)
 
     return (
         now.replace(
             second=0,
-            microsecond=0
+            microsecond=0,
         )
         + timedelta(minutes=1)
     )
 
 
-def public_ranking_item(asset):
-    """
-    Converte resultado interno do scanner
-    para formato simples para o frontend.
-    """
+def build_db_payload(
+    best: Dict[str, Any],
+    entry_time: datetime,
+    expiry_time: datetime,
+) -> Dict[str, Any]:
 
-    opportunity = (
-        asset["grade"] in ("A", "A+")
-        and asset["direction"] in ("BUY", "SELL")
-    )
+    """
+    IMPORTANTE:
+    Só colocamos aqui colunas que já existem
+    na tabela public.signals do Supabase.
+    """
 
     return {
-        "symbol": asset["symbol"],
-
-        "market_type": asset.get(
+        "symbol": best["symbol"],
+        "market_type": best.get(
             "market_type",
-            "NORMAL"
+            "NORMAL",
         ),
+        "direction": best["direction"],
+        "grade": best["grade"],
 
-        "direction": asset["direction"],
+        "entry_time":
+            entry_time.isoformat(),
 
-        "grade": asset["grade"],
+        "expiry_time":
+            expiry_time.isoformat(),
 
-        # NÃO é porcentagem de assertividade.
-        "score": asset["ranking_score"],
+        "expiry_minutes":
+            EXPIRY_MINUTES,
 
-        "price": asset["price"],
+        "entry_price":
+            best.get("price"),
 
-        "trend": asset["trends"]["15m"],
+        "buy_score":
+            best.get("buy_score"),
 
-        "trends": asset["trends"],
+        "sell_score":
+            best.get("sell_score"),
 
-        "adx": asset["adx"],
+        "edge":
+            best.get("edge"),
 
-        "status": (
-            "OPPORTUNITY"
-            if opportunity
-            else "BLOCKED"
-        )
+        "trend_10m":
+            best.get("trend_10m"),
+
+        "trend_15m":
+            best.get("trend_15m"),
+
+        "trend_30m":
+            best.get("trend_30m"),
+
+        "trend_1h":
+            best.get("trend_1h"),
+
+        "adx_10m":
+            best.get("adx_10m"),
+
+        "adx_15m":
+            best.get("adx_15m"),
+
+        "confirmations":
+            best.get(
+                "confirmations",
+                [],
+            ),
+
+        "result": None,
+        "exit_price": None,
+
+        "engine_version":
+            best.get(
+                "engine_version",
+                ENGINE_VERSION,
+            ),
+
+        "is_mock": False,
     }
 
 
-# ============================================================
-# HOME
-# ============================================================
+def build_api_signal(
+    best: Dict[str, Any],
+    signal_id: Any,
+    entry_time: datetime,
+    expiry_time: datetime,
+) -> Dict[str, Any]:
+
+    return {
+        "id": signal_id,
+
+        "symbol":
+            best["symbol"],
+
+        "market_type":
+            best.get(
+                "market_type",
+                "NORMAL",
+            ),
+
+        "direction":
+            best["direction"],
+
+        "grade":
+            best["grade"],
+
+        # NÃO é probabilidade.
+        "score":
+            best.get(
+                "ranking_score",
+            ),
+
+        "setup_type":
+            best.get(
+                "setup_type",
+            ),
+
+        "entry_time":
+            entry_time.isoformat(),
+
+        "expiry_time":
+            expiry_time.isoformat(),
+
+        "expiry_minutes":
+            EXPIRY_MINUTES,
+
+        "price":
+            best.get("price"),
+
+        "entry_price":
+            best.get("price"),
+
+        "buy_score":
+            best.get("buy_score"),
+
+        "sell_score":
+            best.get("sell_score"),
+
+        "edge":
+            best.get("edge"),
+
+        "confirmations":
+            best.get(
+                "confirmations",
+                [],
+            ),
+
+        "vetoes":
+            best.get(
+                "vetoes",
+                [],
+            ),
+
+        "market": {
+            "10m":
+                best.get(
+                    "trend_10m"
+                ),
+
+            "15m":
+                best.get(
+                    "trend_15m"
+                ),
+
+            "30m":
+                best.get(
+                    "trend_30m"
+                ),
+
+            "1h":
+                best.get(
+                    "trend_1h"
+                ),
+        },
+
+        "market_state": {
+            "10m":
+                best.get(
+                    "market_state_10m"
+                ),
+
+            "15m":
+                best.get(
+                    "market_state_15m"
+                ),
+
+            "30m":
+                best.get(
+                    "market_state_30m"
+                ),
+
+            "1h":
+                best.get(
+                    "market_state_1h"
+                ),
+        },
+
+        "adx": {
+            "10m":
+                best.get(
+                    "adx_10m"
+                ),
+
+            "15m":
+                best.get(
+                    "adx_15m"
+                ),
+        },
+
+        "candle": {
+            "buy_score":
+                best.get(
+                    "candle_score_buy"
+                ),
+
+            "sell_score":
+                best.get(
+                    "candle_score_sell"
+                ),
+
+            "signals_10m":
+                best.get(
+                    "candle_signals_10m",
+                    [],
+                ),
+
+            "signals_15m":
+                best.get(
+                    "candle_signals_15m",
+                    [],
+                ),
+
+            "contradiction":
+                best.get(
+                    "candle_contradiction",
+                    False,
+                ),
+
+            "contradiction_reason":
+                best.get(
+                    "candle_contradiction_reason"
+                ),
+        },
+
+        "risk_status":
+            best.get(
+                "risk_status",
+                "APROVADO",
+            ),
+
+        "engine_version":
+            best.get(
+                "engine_version",
+                ENGINE_VERSION,
+            ),
+
+        "is_mock": False,
+
+        # O resultado começa pendente.
+        "result": None,
+        "exit_price": None,
+    }
+
+
+# =========================================================
+# ROOT
+# =========================================================
 
 @app.get("/")
-def home():
+def root():
 
     return {
         "app": "Booster Signals",
         "status": "online",
         "api_version": API_VERSION,
         "engine_version": ENGINE_VERSION,
-        "timezone": "America/Sao_Paulo"
+        "timezone":
+            "America/Sao_Paulo",
     }
 
 
-# ============================================================
+# =========================================================
 # HEALTH
-# ============================================================
+# =========================================================
 
 @app.get("/health")
 def health():
 
     return {
         "status": "ok",
-        "api": "online",
-        "engine": "online",
-        "database": "configured",
-        "timestamp": now_sp().isoformat()
+        "api_version":
+            API_VERSION,
+
+        "engine_version":
+            ENGINE_VERSION,
+
+        "timezone":
+            "America/Sao_Paulo",
     }
 
 
-# ============================================================
-# SCANNER MULTIATIVOS
-# ============================================================
+# =========================================================
+# SCANNER
+#
+# Consultar scanner NÃO gera cooldown.
+# =========================================================
 
 @app.get("/scanner")
-def scanner():
+def scanner_endpoint():
 
     try:
 
-        result = scan_market()
+        result = scan_market(
+            force_refresh=False
+        )
 
         return {
             "success": True,
-
-            "scanned_at":
-                result["scanned_at"],
-
-            "assets_scanned":
-                result["assets_scanned"],
-
-            "assets_valid":
-                result["assets_valid"],
-
-            "opportunities":
-                result["opportunities"],
-
-            "best": (
-                public_ranking_item(
-                    result["best"]
-                )
-                if result["best"]
-                else None
-            ),
-
-            "ranking": [
-                public_ranking_item(asset)
-                for asset in result["ranking"]
-            ],
-
-            "errors":
-                result.get("errors", [])
+            **result,
         }
 
-    except Exception as error:
+    except Exception as exc:
 
         raise HTTPException(
             status_code=500,
-            detail=str(error)
+            detail=str(exc),
         )
 
 
-# ============================================================
-# GERAR SINAL REAL
-# ============================================================
+# =========================================================
+# GENERATE SIGNAL
+# =========================================================
 
 @app.post("/generate-signal")
 def generate_signal():
 
     try:
 
-        # ----------------------------------------------------
-        # 1. RODAR SCANNER
-        # ----------------------------------------------------
+        market = scan_market(
+            force_refresh=False
+        )
 
-        result = scan_market()
+        best = market.get(
+            "best"
+        )
 
-        best = result["best"]
+        # ---------------------------------------------
+        # Nenhuma oportunidade
+        # ---------------------------------------------
 
-        # ----------------------------------------------------
-        # 2. NENHUMA OPORTUNIDADE
-        # ----------------------------------------------------
-
-        if best is None:
+        if not best:
 
             return {
                 "success": True,
-
                 "signal": False,
 
                 "message":
-                    "Nenhuma oportunidade A/A+ "
-                    "encontrada neste momento.",
+                    "Nenhuma entrada A/A+ "
+                    "disponível agora.",
 
-                "scanned_at":
-                    result["scanned_at"],
+                "data": None,
 
-                "assets_scanned":
-                    result["assets_scanned"],
+                "ranking":
+                    market.get(
+                        "ranking",
+                        [],
+                    ),
 
-                "assets_valid":
-                    result["assets_valid"],
+                "approved":
+                    market.get(
+                        "approved",
+                        [],
+                    ),
 
-                "opportunities":
-                    0,
-
-                "ranking": [
-                    public_ranking_item(asset)
-                    for asset in result["ranking"]
-                ]
+                "blocked":
+                    market.get(
+                        "blocked",
+                        [],
+                    ),
             }
 
-        # ----------------------------------------------------
-        # 3. HORÁRIOS
-        # ----------------------------------------------------
+        # ---------------------------------------------
+        # Horário
+        # ---------------------------------------------
 
-        entry_time = next_entry_time()
+        entry_time = (
+            next_full_minute()
+        )
 
         expiry_time = (
             entry_time
@@ -267,242 +458,91 @@ def generate_signal():
             )
         )
 
-        # ----------------------------------------------------
-        # 4. PREPARAR SINAL PARA SUPABASE
-        # ----------------------------------------------------
+        # ---------------------------------------------
+        # Banco
+        # ---------------------------------------------
 
-        database_signal = {
-
-            "symbol":
-                best["symbol"],
-
-            "market_type":
-                best.get(
-                    "market_type",
-                    "NORMAL"
-                ),
-
-            "direction":
-                best["direction"],
-
-            "grade":
-                best["grade"],
-
-            "entry_time":
-                entry_time.isoformat(),
-
-            "expiry_time":
-                expiry_time.isoformat(),
-
-            "expiry_minutes":
-                EXPIRY_MINUTES,
-
-            "entry_price":
-                best["price"],
-
-            "buy_score":
-                best["buy_score"],
-
-            "sell_score":
-                best["sell_score"],
-
-            "edge":
-                best["edge"],
-
-            "trend_10m":
-                best["trends"]["10m"],
-
-            "trend_15m":
-                best["trends"]["15m"],
-
-            "trend_30m":
-                best["trends"]["30m"],
-
-            "trend_1h":
-                best["trends"]["1h"],
-
-            "adx_10m":
-                best["adx"]["10m"],
-
-            "adx_15m":
-                best["adx"]["15m"],
-
-            "confirmations":
-                best["confirmations"],
-
-            "engine_version":
-                ENGINE_VERSION,
-
-            "is_mock":
-                False
-        }
-
-        # ----------------------------------------------------
-        # 5. SALVAR NO SUPABASE
-        # ----------------------------------------------------
-
-        saved = save_signal(
-            database_signal
+        db_payload = (
+            build_db_payload(
+                best,
+                entry_time,
+                expiry_time,
+            )
         )
 
-        if (
-            isinstance(saved, list)
-            and len(saved) > 0
-        ):
-            saved_signal = saved[0]
+        saved = save_signal(
+            db_payload
+        )
 
-        else:
-            saved_signal = database_signal
+        if not saved:
+            raise RuntimeError(
+                "Supabase não confirmou "
+                "o salvamento do sinal."
+            )
 
-        # ----------------------------------------------------
-        # 6. RESPOSTA PARA O APP
-        # ----------------------------------------------------
+        saved_row = saved[0]
+
+        signal_id = (
+            saved_row.get("id")
+        )
+
+        # =============================================
+        # COOLDOWN
+        #
+        # SOMENTE AGORA.
+        #
+        # O sinal já foi realmente criado e salvo.
+        # =============================================
+
+        register_cooldown(
+            best["symbol"]
+        )
+
+        # ---------------------------------------------
+        # Response
+        # ---------------------------------------------
+
+        signal_data = (
+            build_api_signal(
+                best,
+                signal_id,
+                entry_time,
+                expiry_time,
+            )
+        )
 
         return {
-
-            "success":
-                True,
-
-            "signal":
-                True,
+            "success": True,
+            "signal": True,
 
             "message":
                 "Oportunidade encontrada.",
 
-            "data": {
+            "data":
+                signal_data,
 
-                "id":
-                    saved_signal.get("id"),
+            "ranking":
+                market.get(
+                    "ranking",
+                    [],
+                ),
 
-                "symbol":
-                    best["symbol"],
+            "approved":
+                market.get(
+                    "approved",
+                    [],
+                ),
 
-                "market_type":
-                    best.get(
-                        "market_type",
-                        "NORMAL"
-                    ),
-
-                "direction":
-                    best["direction"],
-
-                "grade":
-                    best["grade"],
-
-                # Score interno, NÃO porcentagem.
-                "score":
-                    best["ranking_score"],
-
-                "entry_time":
-                    entry_time.isoformat(),
-
-                "expiry_time":
-                    expiry_time.isoformat(),
-
-                "expiry_minutes":
-                    EXPIRY_MINUTES,
-
-                "price":
-                    best["price"],
-
-                "buy_score":
-                    best["buy_score"],
-
-                "sell_score":
-                    best["sell_score"],
-
-                "edge":
-                    best["edge"],
-
-                "confirmations":
-                    best["confirmations"],
-
-                "market": {
-
-                    "10m":
-                        best["trends"]["10m"],
-
-                    "15m":
-                        best["trends"]["15m"],
-
-                    "30m":
-                        best["trends"]["30m"],
-
-                    "1h":
-                        best["trends"]["1h"]
-                },
-
-                "adx": {
-
-                    "10m":
-                        best["adx"]["10m"],
-
-                    "15m":
-                        best["adx"]["15m"]
-                },
-
-                "engine_version":
-                    ENGINE_VERSION,
-
-                "is_mock":
-                    False
-            },
-
-            "scanner": {
-
-                "scanned_at":
-                    result["scanned_at"],
-
-                "assets_scanned":
-                    result["assets_scanned"],
-
-                "assets_valid":
-                    result["assets_valid"],
-
-                "opportunities":
-                    result["opportunities"],
-
-                "ranking": [
-                    public_ranking_item(asset)
-                    for asset in result["ranking"]
-                ]
-            }
+            "blocked":
+                market.get(
+                    "blocked",
+                    [],
+                ),
         }
 
-    except Exception as error:
+    except Exception as exc:
 
         raise HTTPException(
             status_code=500,
-            detail=str(error)
+            detail=str(exc),
         )
-
-
-# ============================================================
-# START
-# ============================================================
-
-if __name__ == "__main__":
-
-    import uvicorn
-
-    print()
-    print("=" * 60)
-    print("🔥 BOOSTER SIGNALS API V2.0")
-    print("=" * 60)
-    print("🚀 API iniciando...")
-    print(f"📊 Engine: {ENGINE_VERSION}")
-    print("🧠 Scanner multiativos: ATIVO")
-    print("🗄️ Supabase: CONFIGURADO")
-    print("🕐 Timezone: America/Sao_Paulo")
-    print()
-    print("📚 Docs:")
-    print("http://127.0.0.1:8000/docs")
-    print("=" * 60)
-    print()
-
-    uvicorn.run(
-        "api:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True
-    )

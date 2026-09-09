@@ -1,128 +1,47 @@
-from collector import get_candles
-from datetime import datetime
-import csv
-import os
-import math
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
 
 
-# ============================================================
-# BOOSTER ENGINE V1.0
-# MOTOR CONSOLIDADO
-# ============================================================
+# =========================================================
+# BOOSTER ENGINE V1.2
+# =========================================================
 
-SYMBOL = "EUR/USD"
-
-EMA_PERIOD = 9
-SMA_PERIOD = 20
-ATR_PERIOD = 14
-ADX_PERIOD = 14
-
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
-
-MAX_DISTANCE_ATR = 1.80
-EXPLOSIVE_ATR = 1.80
-ADX_MIN = 20
-
-LOG_FILE = "signals.csv"
+ENGINE_VERSION = "1.2.0"
 
 
-# ============================================================
-# UTIL
-# ============================================================
+# =========================================================
+# HELPERS
+# =========================================================
 
-def safe_div(a, b):
-    if b == 0:
-        return 0.0
-    return a / b
-
-
-def parse_api_candles(data):
-    values = list(reversed(data["values"]))
-    result = []
-
-    for c in values:
-        result.append({
-            "datetime": datetime.strptime(
-                c["datetime"],
-                "%Y-%m-%d %H:%M:%S"
-            ),
-            "open": float(c["open"]),
-            "high": float(c["high"]),
-            "low": float(c["low"]),
-            "close": float(c["close"])
-        })
-
-    return result
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
-# ============================================================
-# AGREGAÇÃO
-# ============================================================
+def sma(values: List[float], period: int) -> List[Optional[float]]:
+    result: List[Optional[float]] = []
 
-def aggregate(candles, minutes):
-    groups = {}
-
-    for c in candles:
-        dt = c["datetime"]
-
-        total_minutes = dt.hour * 60 + dt.minute
-        bucket_total = (total_minutes // minutes) * minutes
-
-        bucket_hour = (bucket_total // 60) % 24
-        bucket_minute = bucket_total % 60
-
-        bucket = dt.replace(
-            hour=bucket_hour,
-            minute=bucket_minute,
-            second=0,
-            microsecond=0
-        )
-
-        groups.setdefault(bucket, []).append(c)
-
-    result = []
-
-    for bucket in sorted(groups):
-        group = groups[bucket]
-
-        # Descarta candle incompleto
-        if len(group) != minutes:
+    for i in range(len(values)):
+        if i + 1 < period:
+            result.append(None)
             continue
 
-        result.append({
-            "datetime": bucket,
-            "open": group[0]["open"],
-            "high": max(x["high"] for x in group),
-            "low": min(x["low"] for x in group),
-            "close": group[-1]["close"]
-        })
+        window = values[i - period + 1:i + 1]
+        result.append(sum(window) / period)
 
     return result
 
 
-# ============================================================
-# SMA
-# ============================================================
+def ema(values: List[float], period: int) -> List[Optional[float]]:
+    if not values:
+        return []
 
-def sma_series(values, period):
-    result = [None] * len(values)
-
-    for i in range(period - 1, len(values)):
-        result[i] = sum(
-            values[i - period + 1:i + 1]
-        ) / period
-
-    return result
-
-
-# ============================================================
-# EMA
-# ============================================================
-
-def ema_series(values, period):
-    result = [None] * len(values)
+    result: List[Optional[float]] = [None] * len(values)
 
     if len(values) < period:
         return result
@@ -130,13 +49,13 @@ def ema_series(values, period):
     seed = sum(values[:period]) / period
     result[period - 1] = seed
 
-    alpha = 2 / (period + 1)
+    multiplier = 2 / (period + 1)
     previous = seed
 
     for i in range(period, len(values)):
         current = (
-            values[i] * alpha
-            + previous * (1 - alpha)
+            values[i] * multiplier
+            + previous * (1 - multiplier)
         )
 
         result[i] = current
@@ -145,12 +64,8 @@ def ema_series(values, period):
     return result
 
 
-# ============================================================
-# WILDER RMA
-# ============================================================
-
-def rma_series(values, period):
-    result = [None] * len(values)
+def rma(values: List[float], period: int) -> List[Optional[float]]:
+    result: List[Optional[float]] = [None] * len(values)
 
     if len(values) < period:
         return result
@@ -162,7 +77,7 @@ def rma_series(values, period):
 
     for i in range(period, len(values)):
         current = (
-            previous * (period - 1)
+            (previous * (period - 1))
             + values[i]
         ) / period
 
@@ -172,976 +87,1195 @@ def rma_series(values, period):
     return result
 
 
-# ============================================================
-# ATR / DI / ADX
-# ============================================================
+# =========================================================
+# ATR / DMI / ADX
+# =========================================================
 
-def dmi_atr(candles, period=14):
-    n = len(candles)
+def calculate_dmi_adx(
+    candles: List[Dict[str, Any]],
+    period: int = 14,
+) -> Dict[str, List[Optional[float]]]:
 
-    tr = [0.0] * n
-    plus_dm = [0.0] * n
-    minus_dm = [0.0] * n
+    size = len(candles)
 
-    for i in range(n):
-        high = candles[i]["high"]
-        low = candles[i]["low"]
+    tr = [0.0] * size
+    plus_dm = [0.0] * size
+    minus_dm = [0.0] * size
 
-        if i == 0:
-            tr[i] = high - low
-            continue
+    for i in range(1, size):
 
-        prev_high = candles[i - 1]["high"]
-        prev_low = candles[i - 1]["low"]
-        prev_close = candles[i - 1]["close"]
+        high = safe_float(candles[i]["high"])
+        low = safe_float(candles[i]["low"])
+
+        prev_high = safe_float(candles[i - 1]["high"])
+        prev_low = safe_float(candles[i - 1]["low"])
+        prev_close = safe_float(candles[i - 1]["close"])
 
         tr[i] = max(
             high - low,
             abs(high - prev_close),
-            abs(low - prev_close)
+            abs(low - prev_close),
         )
 
-        up = high - prev_high
-        down = prev_low - low
+        up_move = high - prev_high
+        down_move = prev_low - low
 
-        plus_dm[i] = (
-            up if up > down and up > 0 else 0.0
-        )
+        if up_move > down_move and up_move > 0:
+            plus_dm[i] = up_move
 
-        minus_dm[i] = (
-            down if down > up and down > 0 else 0.0
-        )
+        if down_move > up_move and down_move > 0:
+            minus_dm[i] = down_move
 
-    atr = rma_series(tr, period)
-    plus_rma = rma_series(plus_dm, period)
-    minus_rma = rma_series(minus_dm, period)
+    atr = rma(tr, period)
+    plus_smoothed = rma(plus_dm, period)
+    minus_smoothed = rma(minus_dm, period)
 
-    plus_di = [None] * n
-    minus_di = [None] * n
-    dx = [None] * n
+    plus_di: List[Optional[float]] = [None] * size
+    minus_di: List[Optional[float]] = [None] * size
+    dx: List[float] = [0.0] * size
 
-    for i in range(n):
-        if atr[i] is None or atr[i] == 0:
+    for i in range(size):
+
+        if (
+            atr[i] is None
+            or atr[i] == 0
+            or plus_smoothed[i] is None
+            or minus_smoothed[i] is None
+        ):
             continue
 
-        plus_di[i] = 100 * safe_div(
-            plus_rma[i], atr[i]
-        )
+        plus = 100 * plus_smoothed[i] / atr[i]
+        minus = 100 * minus_smoothed[i] / atr[i]
 
-        minus_di[i] = 100 * safe_div(
-            minus_rma[i], atr[i]
-        )
+        plus_di[i] = plus
+        minus_di[i] = minus
 
-        denominator = plus_di[i] + minus_di[i]
+        denominator = plus + minus
 
         if denominator > 0:
             dx[i] = (
                 100
-                * abs(plus_di[i] - minus_di[i])
+                * abs(plus - minus)
                 / denominator
             )
 
-    # ADX sobre os DX válidos
-    adx = [None] * n
+    adx = rma(dx, period)
 
-    valid_indices = [
-        i for i, value in enumerate(dx)
-        if value is not None
-    ]
-
-    if len(valid_indices) >= period:
-        first_indices = valid_indices[:period]
-
-        seed = sum(
-            dx[i] for i in first_indices
-        ) / period
-
-        seed_index = first_indices[-1]
-        adx[seed_index] = seed
-        previous = seed
-
-        for i in valid_indices[period:]:
-            current = (
-                previous * (period - 1)
-                + dx[i]
-            ) / period
-
-            adx[i] = current
-            previous = current
-
-    return atr, plus_di, minus_di, adx
+    return {
+        "atr": atr,
+        "plus_di": plus_di,
+        "minus_di": minus_di,
+        "adx": adx,
+    }
 
 
-# ============================================================
+# =========================================================
 # MACD
-# ============================================================
+# =========================================================
 
-def macd(candles):
-    closes = [c["close"] for c in candles]
+def calculate_macd(
+    closes: List[float],
+) -> Dict[str, List[Optional[float]]]:
 
-    fast = ema_series(closes, MACD_FAST)
-    slow = ema_series(closes, MACD_SLOW)
+    ema12 = ema(closes, 12)
+    ema26 = ema(closes, 26)
 
-    macd_line = [None] * len(closes)
+    macd_line: List[Optional[float]] = [None] * len(closes)
 
     for i in range(len(closes)):
-        if fast[i] is not None and slow[i] is not None:
-            macd_line[i] = fast[i] - slow[i]
+        if ema12[i] is None or ema26[i] is None:
+            continue
 
-    valid = [
-        value for value in macd_line
-        if value is not None
+        macd_line[i] = ema12[i] - ema26[i]
+
+    valid_macd = [
+        value if value is not None else 0.0
+        for value in macd_line
     ]
 
-    signal_valid = ema_series(
-        valid,
-        MACD_SIGNAL
-    )
+    signal_line = ema(valid_macd, 9)
 
-    signal = [None] * len(closes)
-
-    valid_position = 0
-
-    for i in range(len(closes)):
-        if macd_line[i] is not None:
-            signal[i] = signal_valid[valid_position]
-            valid_position += 1
-
-    hist = [None] * len(closes)
+    histogram: List[Optional[float]] = [None] * len(closes)
 
     for i in range(len(closes)):
         if (
-            macd_line[i] is not None
-            and signal[i] is not None
+            macd_line[i] is None
+            or signal_line[i] is None
         ):
-            hist[i] = (
-                macd_line[i] - signal[i]
-            )
+            continue
 
-    return macd_line, signal, hist
+        histogram[i] = (
+            macd_line[i]
+            - signal_line[i]
+        )
+
+    return {
+        "macd": macd_line,
+        "signal": signal_line,
+        "histogram": histogram,
+    }
 
 
-# ============================================================
-# FRACTAIS CONFIRMADOS
-# ============================================================
+# =========================================================
+# FRACTALS CONFIRMADOS
+# =========================================================
 
-def last_confirmed_fractals(candles):
-    fractal_high = None
-    fractal_low = None
+def confirmed_fractals(
+    candles: List[Dict[str, Any]],
+) -> Dict[str, Optional[float]]:
 
-    # Os dois candles à direita precisam existir.
+    last_high = None
+    last_low = None
+
+    if len(candles) < 5:
+        return {
+            "high": None,
+            "low": None,
+        }
+
     for i in range(2, len(candles) - 2):
-        h = candles[i]["high"]
-        l = candles[i]["low"]
 
-        is_high = (
-            h > candles[i - 1]["high"]
-            and h > candles[i - 2]["high"]
-            and h > candles[i + 1]["high"]
-            and h > candles[i + 2]["high"]
-        )
+        high = safe_float(candles[i]["high"])
+        low = safe_float(candles[i]["low"])
 
-        is_low = (
-            l < candles[i - 1]["low"]
-            and l < candles[i - 2]["low"]
-            and l < candles[i + 1]["low"]
-            and l < candles[i + 2]["low"]
-        )
+        if (
+            high > safe_float(candles[i - 1]["high"])
+            and high > safe_float(candles[i - 2]["high"])
+            and high > safe_float(candles[i + 1]["high"])
+            and high > safe_float(candles[i + 2]["high"])
+        ):
+            last_high = high
 
-        if is_high:
-            fractal_high = h
+        if (
+            low < safe_float(candles[i - 1]["low"])
+            and low < safe_float(candles[i - 2]["low"])
+            and low < safe_float(candles[i + 1]["low"])
+            and low < safe_float(candles[i + 2]["low"])
+        ):
+            last_low = low
 
-        if is_low:
-            fractal_low = l
+    return {
+        "high": last_high,
+        "low": last_low,
+    }
 
-    return fractal_high, fractal_low
 
+# =========================================================
+# CANDLE ENGINE
+# =========================================================
 
-# ============================================================
-# PRICE ACTION
-# ============================================================
+def candle_metrics(
+    candle: Dict[str, Any],
+) -> Dict[str, float]:
 
-def price_action(candles):
-    c = candles[-1]
-    p = candles[-2]
+    open_price = safe_float(candle["open"])
+    high = safe_float(candle["high"])
+    low = safe_float(candle["low"])
+    close = safe_float(candle["close"])
 
-    body = abs(c["close"] - c["open"])
-    candle_range = c["high"] - c["low"]
+    total_range = max(high - low, 1e-12)
+    body = abs(close - open_price)
 
     upper_wick = (
-        c["high"]
-        - max(c["open"], c["close"])
+        high - max(open_price, close)
     )
 
     lower_wick = (
-        min(c["open"], c["close"])
-        - c["low"]
+        min(open_price, close) - low
     )
 
-    bullish_rejection = (
-        lower_wick > body * 1.2
-        and c["close"] > c["open"]
-    )
+    body_ratio = body / total_range
+    upper_ratio = upper_wick / total_range
+    lower_ratio = lower_wick / total_range
 
-    bearish_rejection = (
-        upper_wick > body * 1.2
-        and c["close"] < c["open"]
-    )
-
-    bullish_engulf = (
-        c["close"] > c["open"]
-        and p["close"] < p["open"]
-        and c["open"] <= p["close"]
-        and c["close"] >= p["open"]
-    )
-
-    bearish_engulf = (
-        c["close"] < c["open"]
-        and p["close"] > p["open"]
-        and c["open"] >= p["close"]
-        and c["close"] <= p["open"]
+    close_position = (
+        (close - low) / total_range
     )
 
     return {
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close,
+        "range": total_range,
         "body": body,
-        "range": candle_range,
-        "bull_rejection": bullish_rejection,
-        "bear_rejection": bearish_rejection,
-        "bull_engulf": bullish_engulf,
-        "bear_engulf": bearish_engulf
+        "upper_wick": upper_wick,
+        "lower_wick": lower_wick,
+        "body_ratio": body_ratio,
+        "upper_ratio": upper_ratio,
+        "lower_ratio": lower_ratio,
+        "close_position": close_position,
     }
 
 
-# ============================================================
-# ANALISAR TIMEFRAME
-# ============================================================
+def analyze_candles(
+    candles: List[Dict[str, Any]],
+    atr_value: float,
+) -> Dict[str, Any]:
 
-def analyze_tf(name, candles):
-    if len(candles) < 60:
-        raise ValueError(
-            f"{name}: histórico insuficiente "
-            f"({len(candles)} candles)"
+    if len(candles) < 6:
+        return {
+            "buy_score": 0,
+            "sell_score": 0,
+            "signals": [],
+            "indecision": False,
+            "explosive": False,
+        }
+
+    current = candle_metrics(candles[-1])
+    previous = candle_metrics(candles[-2])
+
+    signals: List[str] = []
+
+    buy_score = 0
+    sell_score = 0
+
+    # -----------------------------------------------------
+    # Rejeição inferior
+    # -----------------------------------------------------
+
+    if (
+        current["lower_wick"]
+        > current["body"] * 1.5
+        and current["lower_ratio"] >= 0.40
+    ):
+        buy_score += 3
+        signals.append(
+            "rejeição inferior forte"
         )
 
-    closes = [c["close"] for c in candles]
+    # -----------------------------------------------------
+    # Rejeição superior
+    # -----------------------------------------------------
 
-    ema9 = ema_series(closes, EMA_PERIOD)
-    sma20 = sma_series(closes, SMA_PERIOD)
+    if (
+        current["upper_wick"]
+        > current["body"] * 1.5
+        and current["upper_ratio"] >= 0.40
+    ):
+        sell_score += 3
+        signals.append(
+            "rejeição superior forte"
+        )
 
-    atr, plus_di, minus_di, adx = dmi_atr(
-        candles,
-        ADX_PERIOD
+    # -----------------------------------------------------
+    # Fechamento forte
+    # -----------------------------------------------------
+
+    if (
+        current["close"] > current["open"]
+        and current["body_ratio"] >= 0.60
+        and current["close_position"] >= 0.75
+    ):
+        buy_score += 3
+        signals.append(
+            "fechamento comprador forte"
+        )
+
+    if (
+        current["close"] < current["open"]
+        and current["body_ratio"] >= 0.60
+        and current["close_position"] <= 0.25
+    ):
+        sell_score += 3
+        signals.append(
+            "fechamento vendedor forte"
+        )
+
+    # -----------------------------------------------------
+    # Engolfo
+    # -----------------------------------------------------
+
+    bullish_engulfing = (
+        previous["close"] < previous["open"]
+        and current["close"] > current["open"]
+        and current["open"] <= previous["close"]
+        and current["close"] >= previous["open"]
     )
 
-    macd_line, macd_signal, hist = macd(
+    bearish_engulfing = (
+        previous["close"] > previous["open"]
+        and current["close"] < current["open"]
+        and current["open"] >= previous["close"]
+        and current["close"] <= previous["open"]
+    )
+
+    if bullish_engulfing:
+        buy_score += 3
+        signals.append(
+            "engolfo comprador"
+        )
+
+    if bearish_engulfing:
+        sell_score += 3
+        signals.append(
+            "engolfo vendedor"
+        )
+
+    # -----------------------------------------------------
+    # Sequência das últimas 5 velas
+    # -----------------------------------------------------
+
+    recent = candles[-5:]
+
+    bullish_count = sum(
+        1
+        for candle in recent
+        if safe_float(candle["close"])
+        > safe_float(candle["open"])
+    )
+
+    bearish_count = sum(
+        1
+        for candle in recent
+        if safe_float(candle["close"])
+        < safe_float(candle["open"])
+    )
+
+    if bullish_count >= 4:
+        buy_score += 2
+        signals.append(
+            "sequência compradora"
+        )
+
+    if bearish_count >= 4:
+        sell_score += 2
+        signals.append(
+            "sequência vendedora"
+        )
+
+    # -----------------------------------------------------
+    # Falha de continuação
+    # -----------------------------------------------------
+
+    if (
+        previous["close"] > previous["open"]
+        and current["close"] < current["open"]
+        and current["close"]
+        < (
+            previous["open"]
+            + previous["close"]
+        ) / 2
+    ):
+        sell_score += 2
+        signals.append(
+            "falha de continuação compradora"
+        )
+
+    if (
+        previous["close"] < previous["open"]
+        and current["close"] > current["open"]
+        and current["close"]
+        > (
+            previous["open"]
+            + previous["close"]
+        ) / 2
+    ):
+        buy_score += 2
+        signals.append(
+            "falha de continuação vendedora"
+        )
+
+    # -----------------------------------------------------
+    # Candle explosivo
+    # -----------------------------------------------------
+
+    explosive = False
+
+    if (
+        atr_value > 0
+        and current["range"] > atr_value * 1.8
+    ):
+        explosive = True
+        signals.append(
+            "candle explosivo"
+        )
+
+    # -----------------------------------------------------
+    # Indecisão
+    # -----------------------------------------------------
+
+    indecision = (
+        current["body_ratio"] <= 0.20
+        and current["upper_ratio"] >= 0.25
+        and current["lower_ratio"] >= 0.25
+    )
+
+    if indecision:
+        buy_score -= 2
+        sell_score -= 2
+
+        signals.append(
+            "indecisão"
+        )
+
+    return {
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "signals": signals,
+        "indecision": indecision,
+        "explosive": explosive,
+        "metrics": current,
+    }
+
+
+# =========================================================
+# ANALYZE TIMEFRAME
+# =========================================================
+
+def analyze_tf(
+    candles: List[Dict[str, Any]],
+    timeframe: str,
+) -> Dict[str, Any]:
+
+    if len(candles) < 40:
+        raise ValueError(
+            f"{timeframe}: histórico insuficiente"
+        )
+
+    closes = [
+        safe_float(candle["close"])
+        for candle in candles
+    ]
+
+    ema9_series = ema(closes, 9)
+    sma20_series = sma(closes, 20)
+
+    dmi = calculate_dmi_adx(
+        candles,
+        14,
+    )
+
+    macd = calculate_macd(
+        closes
+    )
+
+    fractals = confirmed_fractals(
         candles
     )
 
-    i = len(candles) - 1
-    previous = i - 1
+    index = len(candles) - 1
 
-    required = [
-        ema9[i],
-        sma20[i],
-        atr[i],
-        plus_di[i],
-        minus_di[i],
-        adx[i],
-        hist[i]
+    close = closes[index]
+
+    ema9_value = safe_float(
+        ema9_series[index]
+    )
+
+    sma20_value = safe_float(
+        sma20_series[index]
+    )
+
+    previous_ema9 = safe_float(
+        ema9_series[index - 1]
+    )
+
+    previous_sma20 = safe_float(
+        sma20_series[index - 1]
+    )
+
+    atr = safe_float(
+        dmi["atr"][index]
+    )
+
+    plus_di = safe_float(
+        dmi["plus_di"][index]
+    )
+
+    minus_di = safe_float(
+        dmi["minus_di"][index]
+    )
+
+    adx = safe_float(
+        dmi["adx"][index]
+    )
+
+    macd_histogram = safe_float(
+        macd["histogram"][index]
+    )
+
+    ema_slope = (
+        ema9_value
+        - previous_ema9
+    )
+
+    sma_slope = (
+        sma20_value
+        - previous_sma20
+    )
+
+    # -----------------------------------------------------
+    # Tendência
+    # -----------------------------------------------------
+
+    trend = "NEUTRO"
+
+    if (
+        close > ema9_value
+        and ema9_value > sma20_value
+        and ema_slope > 0
+        and sma_slope >= 0
+    ):
+        trend = "ALTA"
+
+    elif (
+        close < ema9_value
+        and ema9_value < sma20_value
+        and ema_slope < 0
+        and sma_slope <= 0
+    ):
+        trend = "BAIXA"
+
+    # -----------------------------------------------------
+    # Candle Engine
+    # -----------------------------------------------------
+
+    candle_analysis = analyze_candles(
+        candles,
+        atr,
+    )
+
+    candle_buy = candle_analysis[
+        "buy_score"
     ]
 
-    if any(x is None for x in required):
-        raise ValueError(
-            f"{name}: indicadores não estabilizados"
+    candle_sell = candle_analysis[
+        "sell_score"
+    ]
+
+    # -----------------------------------------------------
+    # Breakout
+    # -----------------------------------------------------
+
+    breakout_buy = False
+    breakout_sell = False
+
+    if fractals["high"] is not None:
+        breakout_buy = (
+            close > fractals["high"]
         )
 
-    price = closes[i]
+    if fractals["low"] is not None:
+        breakout_sell = (
+            close < fractals["low"]
+        )
 
-    ema_up = (
-        ema9[previous] is not None
-        and ema9[i] > ema9[previous]
+    # -----------------------------------------------------
+    # Distância da EMA
+    # -----------------------------------------------------
+
+    distance_ema_atr = 0.0
+
+    if atr > 0:
+        distance_ema_atr = (
+            abs(close - ema9_value)
+            / atr
+        )
+
+    # -----------------------------------------------------
+    # Compressão
+    # -----------------------------------------------------
+
+    ma_distance_atr = 0.0
+
+    if atr > 0:
+        ma_distance_atr = (
+            abs(ema9_value - sma20_value)
+            / atr
+        )
+
+    compression = (
+        ma_distance_atr < 0.10
     )
 
-    ema_down = (
-        ema9[previous] is not None
-        and ema9[i] < ema9[previous]
-    )
+    # -----------------------------------------------------
+    # Estado do mercado
+    # -----------------------------------------------------
 
-    hist_up = (
-        hist[previous] is not None
-        and hist[i] > hist[previous]
-    )
+    market_state = "TRANSICAO"
 
-    hist_down = (
-        hist[previous] is not None
-        and hist[i] < hist[previous]
-    )
+    if (
+        adx < 15
+        and compression
+    ):
+        market_state = "LATERAL"
 
-    bull_trend = (
-        ema9[i] > sma20[i]
-        and price > ema9[i]
-        and ema_up
-    )
+    elif (
+        trend == "ALTA"
+        and plus_di > minus_di
+        and adx >= 18
+    ):
+        market_state = (
+            "CONTINUACAO_ALTA"
+        )
 
-    bear_trend = (
-        ema9[i] < sma20[i]
-        and price < ema9[i]
-        and ema_down
-    )
+    elif (
+        trend == "BAIXA"
+        and minus_di > plus_di
+        and adx >= 18
+    ):
+        market_state = (
+            "CONTINUACAO_BAIXA"
+        )
 
-    if bull_trend:
-        trend = "ALTA"
-    elif bear_trend:
-        trend = "BAIXA"
-    else:
-        trend = "NEUTRO"
+    elif (
+        candle_buy >= 4
+        and trend in (
+            "BAIXA",
+            "NEUTRO",
+        )
+        and plus_di
+        >= minus_di * 0.85
+    ):
+        market_state = (
+            "REVERSAO_ALTA"
+        )
 
-    dmi_bull = plus_di[i] > minus_di[i]
-    dmi_bear = minus_di[i] > plus_di[i]
-
-    impulse_bull = (
-        ema_up
-        and hist_up
-    )
-
-    impulse_bear = (
-        ema_down
-        and hist_down
-    )
-
-    pa = price_action(candles)
-
-    fractal_high, fractal_low = (
-        last_confirmed_fractals(candles)
-    )
-
-    breakout_bull = (
-        fractal_high is not None
-        and price > fractal_high
-    )
-
-    breakout_bear = (
-        fractal_low is not None
-        and price < fractal_low
-    )
-
-    distance = abs(
-        price - ema9[i]
-    )
-
-    distance_atr = safe_div(
-        distance,
-        atr[i]
-    )
-
-    extended = (
-        distance_atr > MAX_DISTANCE_ATR
-    )
-
-    explosive = (
-        pa["range"]
-        > atr[i] * EXPLOSIVE_ATR
-    )
-
-    # Compressão relativa das médias
-    ma_distance = abs(
-        ema9[i] - sma20[i]
-    )
-
-    compressed = (
-        ma_distance
-        < atr[i] * 0.10
-    )
-
-    adx_ok = adx[i] >= ADX_MIN
+    elif (
+        candle_sell >= 4
+        and trend in (
+            "ALTA",
+            "NEUTRO",
+        )
+        and minus_di
+        >= plus_di * 0.85
+    ):
+        market_state = (
+            "REVERSAO_BAIXA"
+        )
 
     return {
-        "name": name,
-        "datetime": candles[i]["datetime"],
-        "price": price,
+        "timeframe": timeframe,
 
-        "ema9": ema9[i],
-        "sma20": sma20[i],
+        "close": close,
 
-        "atr": atr[i],
-        "adx": adx[i],
-        "plus_di": plus_di[i],
-        "minus_di": minus_di[i],
+        "ema9": ema9_value,
+        "sma20": sma20_value,
 
-        "macd": macd_line[i],
-        "hist": hist[i],
+        "ema_slope": ema_slope,
+        "sma_slope": sma_slope,
 
         "trend": trend,
+        "market_state": market_state,
 
-        "dmi_bull": dmi_bull,
-        "dmi_bear": dmi_bear,
+        "atr": atr,
 
-        "impulse_bull": impulse_bull,
-        "impulse_bear": impulse_bear,
+        "plus_di": plus_di,
+        "minus_di": minus_di,
+        "adx": adx,
 
-        "bull_rejection": pa["bull_rejection"],
-        "bear_rejection": pa["bear_rejection"],
+        "macd_histogram":
+            macd_histogram,
 
-        "bull_engulf": pa["bull_engulf"],
-        "bear_engulf": pa["bear_engulf"],
+        "fractal_high":
+            fractals["high"],
 
-        "breakout_bull": breakout_bull,
-        "breakout_bear": breakout_bear,
+        "fractal_low":
+            fractals["low"],
 
-        "fractal_high": fractal_high,
-        "fractal_low": fractal_low,
+        "breakout_buy":
+            breakout_buy,
 
-        "distance_atr": distance_atr,
+        "breakout_sell":
+            breakout_sell,
 
-        "extended": extended,
-        "explosive": explosive,
-        "compressed": compressed,
+        "distance_ema_atr":
+            distance_ema_atr,
 
-        "adx_ok": adx_ok
+        "compression":
+            compression,
+
+        "candle_score_buy":
+            candle_buy,
+
+        "candle_score_sell":
+            candle_sell,
+
+        "candle_signals":
+            candle_analysis[
+                "signals"
+            ],
+
+        "indecision":
+            candle_analysis[
+                "indecision"
+            ],
+
+        "explosive":
+            candle_analysis[
+                "explosive"
+            ],
     }
 
 
-# ============================================================
-# SCORE
-# ============================================================
+# =========================================================
+# SIGNAL ENGINE
+# =========================================================
 
-def build_signal(tf10, tf15, tf30, tf1h):
-    buy = 0
-    sell = 0
+def build_signal(
+    tf10: Dict[str, Any],
+    tf15: Dict[str, Any],
+    tf30: Dict[str, Any],
+    tf60: Dict[str, Any],
+) -> Dict[str, Any]:
 
-    buy_reasons = []
-    sell_reasons = []
+    buy_score = 0
+    sell_score = 0
 
-    # ========================================================
-    # MACRO — 30M
-    # ========================================================
+    confirmations: List[str] = []
+    warnings: List[str] = []
+    vetoes: List[str] = []
 
-    if tf30["trend"] == "ALTA":
-        buy += 2
-        buy_reasons.append("30M alta")
+    # =====================================================
+    # TREND SCORE
+    # =====================================================
 
-    elif tf30["trend"] == "BAIXA":
-        sell += 2
-        sell_reasons.append("30M baixa")
+    trend_weights = {
+        "10M": 3,
+        "15M": 4,
+        "30M": 4,
+        "1H": 2,
+    }
 
-    # 1H é contexto, não veto absoluto
-    if tf1h["trend"] == "ALTA":
-        buy += 1
-        buy_reasons.append("1H alta")
+    timeframes = [
+        ("10M", tf10),
+        ("15M", tf15),
+        ("30M", tf30),
+        ("1H", tf60),
+    ]
 
-    elif tf1h["trend"] == "BAIXA":
-        sell += 1
-        sell_reasons.append("1H baixa")
+    for label, tf in timeframes:
 
-    # ========================================================
-    # ESTRUTURA — 15M
-    # ========================================================
+        weight = trend_weights[label]
+        trend = tf.get("trend")
 
-    if tf15["trend"] == "ALTA":
-        buy += 3
-        buy_reasons.append("15M alta")
+        if trend == "ALTA":
+            buy_score += weight
+            confirmations.append(
+                f"{label} alta"
+            )
 
-    elif tf15["trend"] == "BAIXA":
-        sell += 3
-        sell_reasons.append("15M baixa")
+        elif trend == "BAIXA":
+            sell_score += weight
+            confirmations.append(
+                f"{label} baixa"
+            )
 
-    # ========================================================
-    # TIMING — 10M
-    # ========================================================
+    # =====================================================
+    # MARKET STATE
+    # =====================================================
 
-    if tf10["trend"] == "ALTA":
-        buy += 2
-        buy_reasons.append("10M alta")
+    states = [
+        tf10.get("market_state"),
+        tf15.get("market_state"),
+        tf30.get("market_state"),
+    ]
 
-    elif tf10["trend"] == "BAIXA":
-        sell += 2
-        sell_reasons.append("10M baixa")
+    continuation_buy = sum(
+        state == "CONTINUACAO_ALTA"
+        for state in states
+    )
 
-    # ========================================================
-    # ADX + DMI
-    # ========================================================
+    continuation_sell = sum(
+        state == "CONTINUACAO_BAIXA"
+        for state in states
+    )
 
-    if tf15["adx_ok"]:
-        if tf15["dmi_bull"]:
-            buy += 2
-            buy_reasons.append("DI+ dominante")
+    reversal_buy = sum(
+        state == "REVERSAO_ALTA"
+        for state in states
+    )
 
-        elif tf15["dmi_bear"]:
-            sell += 2
-            sell_reasons.append("DI- dominante")
+    reversal_sell = sum(
+        state == "REVERSAO_BAIXA"
+        for state in states
+    )
 
-    if tf10["adx_ok"]:
-        if tf10["dmi_bull"]:
-            buy += 1
-            buy_reasons.append("10M DMI alta")
+    setup_type = "CONTINUACAO"
 
-        elif tf10["dmi_bear"]:
-            sell += 1
-            sell_reasons.append("10M DMI baixa")
+    if continuation_buy >= 2:
+        buy_score += 4
+        confirmations.append(
+            "continuação de alta confirmada"
+        )
 
-    # ========================================================
-    # IMPULSO
-    # ========================================================
+    if continuation_sell >= 2:
+        sell_score += 4
+        confirmations.append(
+            "continuação de baixa confirmada"
+        )
 
-    if tf15["impulse_bull"]:
-        buy += 2
-        buy_reasons.append("impulso comprador")
+    if reversal_buy >= 1:
+        buy_score += 3
+        setup_type = "REVERSAO"
 
-    if tf15["impulse_bear"]:
-        sell += 2
-        sell_reasons.append("impulso vendedor")
+        confirmations.append(
+            "reversão de alta detectada"
+        )
 
-    # ========================================================
-    # PRICE ACTION 10M
-    # ========================================================
+    if reversal_sell >= 1:
+        sell_score += 3
+        setup_type = "REVERSAO"
 
-    if tf10["bull_rejection"]:
-        buy += 1
-        buy_reasons.append("rejeição compradora")
+        confirmations.append(
+            "reversão de baixa detectada"
+        )
 
-    if tf10["bear_rejection"]:
-        sell += 1
-        sell_reasons.append("rejeição vendedora")
+    # =====================================================
+    # DMI
+    # =====================================================
 
-    if tf10["bull_engulf"]:
-        buy += 1
-        buy_reasons.append("engolfo comprador")
+    plus_di = safe_float(
+        tf15.get("plus_di")
+    )
 
-    if tf10["bear_engulf"]:
-        sell += 1
-        sell_reasons.append("engolfo vendedor")
+    minus_di = safe_float(
+        tf15.get("minus_di")
+    )
 
-    if tf10["breakout_bull"]:
-        buy += 1
-        buy_reasons.append("rompimento fractal")
+    if plus_di > minus_di * 1.15:
+        buy_score += 3
 
-    if tf10["breakout_bear"]:
-        sell += 1
-        sell_reasons.append("rompimento fractal")
+        confirmations.append(
+            "DI+ dominante"
+        )
 
-    # ========================================================
-    # VETOS DE SEGURANÇA
-    # ========================================================
+    elif minus_di > plus_di * 1.15:
+        sell_score += 3
 
-    vetoes = []
+        confirmations.append(
+            "DI- dominante"
+        )
 
-    if tf10["extended"]:
-        vetoes.append("preço esticado da EMA")
+    # =====================================================
+    # MACD
+    # =====================================================
 
-    if tf10["explosive"]:
-        vetoes.append("candle explosivo")
+    macd10 = safe_float(
+        tf10.get(
+            "macd_histogram"
+        )
+    )
 
-    if tf10["compressed"]:
-        vetoes.append("médias comprimidas")
+    macd15 = safe_float(
+        tf15.get(
+            "macd_histogram"
+        )
+    )
 
-    # ADX muito fraco no timeframe operacional
-    if tf15["adx"] < ADX_MIN:
-        vetoes.append("ADX 15M fraco")
+    if macd10 > 0 and macd15 > 0:
+        buy_score += 2
 
-    # ========================================================
-    # DECISÃO
-    # ========================================================
+    elif macd10 < 0 and macd15 < 0:
+        sell_score += 2
+
+    # =====================================================
+    # CANDLE SCORE
+    # =====================================================
+
+    candle_buy = (
+        safe_float(
+            tf10.get(
+                "candle_score_buy"
+            )
+        )
+        +
+        safe_float(
+            tf15.get(
+                "candle_score_buy"
+            )
+        )
+    )
+
+    candle_sell = (
+        safe_float(
+            tf10.get(
+                "candle_score_sell"
+            )
+        )
+        +
+        safe_float(
+            tf15.get(
+                "candle_score_sell"
+            )
+        )
+    )
+
+    if candle_buy > 0:
+        buy_score += int(
+            candle_buy
+        )
+
+    if candle_sell > 0:
+        sell_score += int(
+            candle_sell
+        )
+
+    if candle_buy >= 4:
+        confirmations.append(
+            "candles favorecem compra"
+        )
+
+    if candle_sell >= 4:
+        confirmations.append(
+            "candles favorecem venda"
+        )
+
+    # =====================================================
+    # BREAKOUT
+    # =====================================================
+
+    breakout_buy = (
+        tf10.get("breakout_buy")
+        or tf15.get("breakout_buy")
+    )
+
+    breakout_sell = (
+        tf10.get("breakout_sell")
+        or tf15.get("breakout_sell")
+    )
+
+    if breakout_buy:
+        buy_score += 2
+
+        confirmations.append(
+            "rompimento comprador"
+        )
+
+    if breakout_sell:
+        sell_score += 2
+
+        confirmations.append(
+            "rompimento vendedor"
+        )
+
+    # =====================================================
+    # DIREÇÃO PRELIMINAR
+    # =====================================================
+
+    preliminary_direction = None
+
+    if buy_score > sell_score:
+        preliminary_direction = "BUY"
+
+    elif sell_score > buy_score:
+        preliminary_direction = "SELL"
+
+    # =====================================================
+    # V1.2 — CANDLE CONTRÁRIO
+    # =====================================================
+
+    contrary_candle_penalty = 0
+    contrary_candle_warning = None
+
+    if preliminary_direction == "BUY":
+
+        if candle_sell >= 5:
+            vetoes.append(
+                "pressão vendedora forte contra BUY"
+            )
+
+            contrary_candle_warning = (
+                "candles apresentam pressão "
+                "vendedora forte"
+            )
+
+        elif candle_sell >= 3:
+            contrary_candle_penalty = 2
+
+            buy_score = max(
+                0,
+                buy_score
+                - contrary_candle_penalty,
+            )
+
+            contrary_candle_warning = (
+                "pressão vendedora contrária "
+                "reduziu a qualidade do BUY"
+            )
+
+            warnings.append(
+                contrary_candle_warning
+            )
+
+    elif preliminary_direction == "SELL":
+
+        if candle_buy >= 5:
+            vetoes.append(
+                "pressão compradora forte contra SELL"
+            )
+
+            contrary_candle_warning = (
+                "candles apresentam pressão "
+                "compradora forte"
+            )
+
+        elif candle_buy >= 3:
+            contrary_candle_penalty = 2
+
+            sell_score = max(
+                0,
+                sell_score
+                - contrary_candle_penalty,
+            )
+
+            contrary_candle_warning = (
+                "pressão compradora contrária "
+                "reduziu a qualidade do SELL"
+            )
+
+            warnings.append(
+                contrary_candle_warning
+            )
+
+    # =====================================================
+    # INDECISÃO 15M
+    # =====================================================
+
+    if tf15.get("indecision"):
+
+        if preliminary_direction == "BUY":
+            buy_score = max(
+                0,
+                buy_score - 1,
+            )
+
+        elif preliminary_direction == "SELL":
+            sell_score = max(
+                0,
+                sell_score - 1,
+            )
+
+        warnings.append(
+            "indecisão no 15M reduziu a qualidade"
+        )
+
+    # =====================================================
+    # VETOES
+    # =====================================================
+
+    adx15 = safe_float(
+        tf15.get("adx")
+    )
+
+    adx10 = safe_float(
+        tf10.get("adx")
+    )
+
+    if adx15 < 18:
+        vetoes.append(
+            "ADX 15M fraco"
+        )
+
+    if adx10 < 12:
+        vetoes.append(
+            "ADX 10M fraco"
+        )
+
+    if (
+        tf10.get("market_state")
+        == "LATERAL"
+        and tf15.get("market_state")
+        == "LATERAL"
+    ):
+        vetoes.append(
+            "mercado lateral"
+        )
+
+    if tf10.get("indecision"):
+        vetoes.append(
+            "última vela 10M indecisa"
+        )
+
+    if (
+        tf10.get("explosive")
+        and safe_float(
+            tf10.get(
+                "distance_ema_atr"
+            )
+        ) > 1.5
+    ):
+        vetoes.append(
+            "movimento excessivamente esticado"
+        )
+
+    # =====================================================
+    # SCORE FINAL
+    # =====================================================
+
+    buy_score = int(
+        max(0, buy_score)
+    )
+
+    sell_score = int(
+        max(0, sell_score)
+    )
+
+    edge = abs(
+        buy_score
+        - sell_score
+    )
 
     direction = None
-    score = 0
-    reasons = []
 
-    if buy > sell:
+    if buy_score > sell_score:
         direction = "BUY"
-        score = buy
-        reasons = buy_reasons
 
-    elif sell > buy:
+    elif sell_score > buy_score:
         direction = "SELL"
-        score = sell
-        reasons = sell_reasons
 
-    # Diferença entre lados
-    edge = abs(buy - sell)
-
-    # Conflito muito grande
-    if edge < 3:
-        vetoes.append("direção sem vantagem suficiente")
-
-    # ========================================================
+    # =====================================================
     # GRADE
-    # ========================================================
+    # =====================================================
 
-    if direction is None or vetoes:
-        grade = "BLOQUEADO"
+    grade = "BLOQUEADO"
 
-    elif score >= 12 and edge >= 7:
-        grade = "A+"
+    if (
+        direction is not None
+        and not vetoes
+    ):
 
-    elif score >= 9 and edge >= 5:
-        grade = "A"
+        if edge >= 12:
+            grade = "A+"
 
-    else:
-        grade = "BLOQUEADO"
+        elif edge >= 8:
+            grade = "A"
 
-    # ========================================================
-    # EXPIRAÇÃO CANDIDATA
-    # NÃO é previsão garantida.
-    # ========================================================
-
-    expiry = None
-
-    if grade == "A+":
-        expiry = "15m"
-
-    elif grade == "A":
-        expiry = "10m"
+    if grade == "BLOQUEADO":
+        direction = None
 
     return {
         "direction": direction,
         "grade": grade,
-        "expiry": expiry,
 
-        "buy_score": buy,
-        "sell_score": sell,
+        "buy_score": buy_score,
+        "sell_score": sell_score,
         "edge": edge,
 
-        "reasons": reasons,
-        "vetoes": vetoes
+        "setup_type":
+            setup_type,
+
+        "candle_score_buy":
+            int(candle_buy),
+
+        "candle_score_sell":
+            int(candle_sell),
+
+        "contrary_candle_penalty":
+            contrary_candle_penalty,
+
+        "contrary_candle_warning":
+            contrary_candle_warning,
+
+        "confirmations":
+            confirmations,
+
+        "warnings":
+            warnings,
+
+        "vetoes":
+            vetoes,
+
+        "engine_version":
+            ENGINE_VERSION,
     }
-
-
-# ============================================================
-# LOG
-# ============================================================
-
-def save_signal(signal, tf10, tf15, tf30, tf1h):
-    if signal["grade"] not in ("A", "A+"):
-        return
-
-    exists = os.path.exists(LOG_FILE)
-
-    fields = [
-        "timestamp",
-        "symbol",
-        "direction",
-        "grade",
-        "expiry",
-
-        "price",
-
-        "buy_score",
-        "sell_score",
-        "edge",
-
-        "trend_10m",
-        "trend_15m",
-        "trend_30m",
-        "trend_1h",
-
-        "adx_10m",
-        "adx_15m",
-
-        "di_plus_15m",
-        "di_minus_15m",
-
-        "atr_10m",
-
-        "ema9_10m",
-        "sma20_10m",
-
-        "distance_atr",
-
-        "result"
-    ]
-
-    row = {
-        "timestamp": tf10["datetime"].isoformat(),
-        "symbol": SYMBOL,
-        "direction": signal["direction"],
-        "grade": signal["grade"],
-        "expiry": signal["expiry"],
-
-        "price": tf10["price"],
-
-        "buy_score": signal["buy_score"],
-        "sell_score": signal["sell_score"],
-        "edge": signal["edge"],
-
-        "trend_10m": tf10["trend"],
-        "trend_15m": tf15["trend"],
-        "trend_30m": tf30["trend"],
-        "trend_1h": tf1h["trend"],
-
-        "adx_10m": round(tf10["adx"], 2),
-        "adx_15m": round(tf15["adx"], 2),
-
-        "di_plus_15m": round(
-            tf15["plus_di"], 2
-        ),
-
-        "di_minus_15m": round(
-            tf15["minus_di"], 2
-        ),
-
-        "atr_10m": tf10["atr"],
-
-        "ema9_10m": tf10["ema9"],
-        "sma20_10m": tf10["sma20"],
-
-        "distance_atr": round(
-            tf10["distance_atr"], 3
-        ),
-
-        "result": ""
-    }
-
-    # Evita duplicar exatamente o mesmo sinal
-    if exists:
-        try:
-            with open(
-                LOG_FILE,
-                "r",
-                newline="",
-                encoding="utf-8"
-            ) as file:
-                rows = list(csv.DictReader(file))
-
-                if rows:
-                    last = rows[-1]
-
-                    if (
-                        last.get("timestamp")
-                        == row["timestamp"]
-                        and last.get("symbol")
-                        == row["symbol"]
-                        and last.get("direction")
-                        == row["direction"]
-                    ):
-                        return
-
-        except Exception:
-            pass
-
-    with open(
-        LOG_FILE,
-        "a",
-        newline="",
-        encoding="utf-8"
-    ) as file:
-
-        writer = csv.DictWriter(
-            file,
-            fieldnames=fields
-        )
-
-        if not exists:
-            writer.writeheader()
-
-        writer.writerow(row)
-
-
-# ============================================================
-# PRINT
-# ============================================================
-
-def print_tf(tf):
-    icon = {
-        "ALTA": "🟢",
-        "BAIXA": "🔴",
-        "NEUTRO": "⚪"
-    }.get(tf["trend"], "⚪")
-
-    print(
-        f"{tf['name']:<4} "
-        f"{icon} {tf['trend']:<7} | "
-        f"ADX {tf['adx']:>5.1f} | "
-        f"DI+ {tf['plus_di']:>5.1f} | "
-        f"DI- {tf['minus_di']:>5.1f} | "
-        f"ATR {tf['atr']:.5f}"
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    print()
-    print("🔥 BOOSTER SIGNALS ENGINE V1.0")
-    print("=" * 78)
-
-    try:
-        print("📡 Carregando EUR/USD 1m...")
-
-        data = get_candles(
-            symbol=SYMBOL,
-            interval="1min",
-            outputsize=5000
-        )
-
-        base = parse_api_candles(data)
-
-        print(
-            f"✅ {len(base)} candles 1m recebidos"
-        )
-
-        print("🧱 Construindo timeframes...")
-
-        candles_10 = aggregate(base, 10)
-        candles_15 = aggregate(base, 15)
-        candles_30 = aggregate(base, 30)
-        candles_60 = aggregate(base, 60)
-
-        print(
-            f"10M: {len(candles_10)} | "
-            f"15M: {len(candles_15)} | "
-            f"30M: {len(candles_30)} | "
-            f"1H: {len(candles_60)}"
-        )
-
-        tf10 = analyze_tf(
-            "10M",
-            candles_10
-        )
-
-        tf15 = analyze_tf(
-            "15M",
-            candles_15
-        )
-
-        tf30 = analyze_tf(
-            "30M",
-            candles_30
-        )
-
-        tf1h = analyze_tf(
-            "1H",
-            candles_60
-        )
-
-        print()
-        print("=" * 78)
-        print("📊 MERCADO")
-        print("=" * 78)
-
-        print_tf(tf10)
-        print_tf(tf15)
-        print_tf(tf30)
-        print_tf(tf1h)
-
-        signal = build_signal(
-            tf10,
-            tf15,
-            tf30,
-            tf1h
-        )
-
-        print()
-        print("=" * 78)
-        print("🧠 BOOSTER ANALYSIS")
-        print("=" * 78)
-
-        print(
-            f"BUY SCORE  : "
-            f"{signal['buy_score']}"
-        )
-
-        print(
-            f"SELL SCORE : "
-            f"{signal['sell_score']}"
-        )
-
-        print(
-            f"EDGE       : "
-            f"{signal['edge']}"
-        )
-
-        print()
-
-        if signal["grade"] in ("A", "A+"):
-
-            print(
-                "🚨 SINAL ENCONTRADO"
-            )
-
-            print(
-                f"Direção   : "
-                f"{signal['direction']}"
-            )
-
-            print(
-                f"Qualidade : "
-                f"{signal['grade']}"
-            )
-
-            print(
-                f"Expiração candidata: "
-                f"{signal['expiry']}"
-            )
-
-            print(
-                f"Preço     : "
-                f"{tf10['price']:.5f}"
-            )
-
-            print()
-            print("CONFIRMAÇÕES:")
-
-            for reason in signal["reasons"]:
-                print(
-                    f"  ✅ {reason}"
-                )
-
-            save_signal(
-                signal,
-                tf10,
-                tf15,
-                tf30,
-                tf1h
-            )
-
-            print()
-            print(
-                "💾 Sinal registrado "
-                "em signals.csv"
-            )
-
-        else:
-
-            print("🚫 SEM ENTRADA")
-
-            if signal["direction"]:
-                print(
-                    f"Viés atual: "
-                    f"{signal['direction']}"
-                )
-
-            print()
-            print("MOTIVOS:")
-
-            if signal["vetoes"]:
-                for veto in signal["vetoes"]:
-                    print(
-                        f"  ❌ {veto}"
-                    )
-            else:
-                print(
-                    "  ❌ Score insuficiente"
-                )
-
-        print()
-        print("=" * 78)
-
-        print(
-            "⚠️ A/A+ são classificações do algoritmo, "
-            "não probabilidades de acerto."
-        )
-
-        print(
-            "🔥 BOOSTER ENGINE FINALIZADO"
-        )
-
-    except Exception as error:
-        print()
-        print("❌ ERRO:")
-        print(error)
-
-
-if __name__ == "__main__":
-    main()

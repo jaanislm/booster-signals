@@ -3,3 +3,6 @@
 __pycache__/
 session.json
 *.csv
+quotex_cache/
+quotex-historical-data/
+session_old.json

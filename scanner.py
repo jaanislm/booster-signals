@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import time
 import threading
 from datetime import datetime
@@ -8,37 +7,22 @@ from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List
 
-import requests
-from dotenv import load_dotenv
 
 from engine import analyze_tf, build_signal
 from quotex_feed import fetch_1m_quotex
 
 
 # =========================================================
-# BOOSTER SCANNER V1.3
-# 16 pares + controle de quota + cache + correlação
+# BOOSTER SCANNER V1.4
+# Quotex + 16 pares + cache + correlação
 # =========================================================
-
-load_dotenv()
 
 TZ = ZoneInfo("America/Sao_Paulo")
 
-API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-
-if not API_KEY:
-    raise RuntimeError("TWELVE_DATA_API_KEY não encontrada.")
-
-TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
-
-OUTPUTSIZE = 5000
 EXPIRY_MINUTES = 10
-SCANNER_VERSION = "1.3.0"
+SCANNER_VERSION = "1.4.0"
 
-# Plano Basic = 8 créditos/min.
-# Deixamos o scanner trabalhar em lotes de até 8.
 BATCH_SIZE = 8
-BATCH_WAIT_SECONDS = 61
 
 CACHE_TTL_SECONDS = 60 * 5
 
@@ -164,96 +148,6 @@ def signals_correlated(
             return True
 
     return False
-
-
-# =========================================================
-# TWELVE DATA
-# =========================================================
-
-def fetch_1m(
-    symbol: str,
-    max_retries: int = 2,
-) -> List[Dict[str, Any]]:
-
-    params = {
-        "symbol": symbol,
-        "interval": "1min",
-        "outputsize": OUTPUTSIZE,
-        "apikey": API_KEY,
-        "timezone": "America/Sao_Paulo",
-        "format": "JSON",
-    }
-
-    for attempt in range(max_retries + 1):
-
-        try:
-            response = requests.get(
-                TWELVE_DATA_URL,
-                params=params,
-                timeout=30,
-            )
-
-            # ---------------------------------------------
-            # Rate limit
-            # ---------------------------------------------
-
-            if response.status_code == 429:
-
-                if attempt >= max_retries:
-                    raise RuntimeError(
-                        f"{symbol}: limite da Twelve Data atingido"
-                    )
-
-                print(
-                    f"[QUOTA] {symbol}: aguardando próximo minuto..."
-                )
-
-                time.sleep(61)
-                continue
-
-            response.raise_for_status()
-
-            payload = response.json()
-
-            if payload.get("status") == "error":
-                raise RuntimeError(
-                    f"{symbol}: "
-                    f"{payload.get('message', 'erro Twelve Data')}"
-                )
-
-            values = payload.get("values")
-
-            if not values:
-                raise RuntimeError(
-                    f"{symbol}: nenhum candle retornado"
-                )
-
-            candles = []
-
-            # Twelve Data retorna mais recente primeiro.
-            for item in reversed(values):
-                candles.append({
-                    "datetime": item["datetime"],
-                    "open": float(item["open"]),
-                    "high": float(item["high"]),
-                    "low": float(item["low"]),
-                    "close": float(item["close"]),
-                })
-
-            return candles
-
-        except requests.RequestException as exc:
-
-            if attempt >= max_retries:
-                raise RuntimeError(
-                    f"{symbol}: falha HTTP: {exc}"
-                )
-
-            time.sleep(3)
-
-    raise RuntimeError(
-        f"{symbol}: não foi possível obter candles"
-    )
 
 
 # =========================================================
@@ -876,7 +770,7 @@ def scan_market(
 
     print("")
     print("=" * 60)
-    print("BOOSTER SCANNER V1.3")
+    print("BOOSTER SCANNER V1.4")
     print("=" * 60)
 
     results = []
@@ -917,22 +811,6 @@ def scan_market(
         errors.extend(
             batch_errors
         )
-
-        # ---------------------------------------------
-        # Esperar reset de créditos
-        # ---------------------------------------------
-
-        if index < len(batches) - 1:
-
-            print("")
-            print(
-                "Aguardando reset da quota "
-                "da Twelve Data..."
-            )
-
-            time.sleep(
-                BATCH_WAIT_SECONDS
-            )
 
     # -----------------------------------------------------
     # Ranking

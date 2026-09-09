@@ -364,185 +364,114 @@ def health():
 
 
 # =========================================================
-# SCANNER
-#
-# Consultar scanner NÃO gera cooldown.
+# CLOUD API
+# =========================================================
+# O Render NÃO consulta mais a Quotex.
+# A coleta/análise acontece no PC pelo booster_local.py.
+# O Render permanece apenas como API online/health.
 # =========================================================
 
 @app.get("/scanner")
 def scanner_endpoint():
+    return {
+        "success": True,
+        "mode": "local_worker",
+        "message": "Scanner executado localmente pelo Booster Local Worker.",
+    }
 
-    try:
-
-        result = scan_market(
-            force_refresh=False
-        )
-
-        return {
-            "success": True,
-            **result,
-        }
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        )
-
-
-# =========================================================
-# GENERATE SIGNAL
-# =========================================================
 
 @app.post("/generate-signal")
 def generate_signal():
+    return {
+        "success": True,
+        "signal": False,
+        "mode": "local_worker",
+        "message": "Geração de sinais executada localmente pelo Booster Local Worker.",
+        "data": None,
+    }
 
-    try:
 
-        market = scan_market(
-            force_refresh=False
-        )
+# =========================================================
+# LOCAL SIGNAL GENERATOR
+# =========================================================
 
-        best = market.get(
-            "best"
-        )
+def generate_signal_local() -> Dict[str, Any]:
+    """
+    Executa o mesmo fluxo de /generate-signal diretamente no PC:
+    Quotex local -> scanner -> engine -> Supabase.
+    Não depende do Render para acessar a Quotex.
+    """
 
-        # ---------------------------------------------
-        # Nenhuma oportunidade
-        # ---------------------------------------------
+    market = scan_market(force_refresh=False)
+    best = market.get("best")
 
-        if not best:
-
-            return {
-                "success": True,
-                "signal": False,
-
-                "message":
-                    "Nenhuma entrada A/A+ "
-                    "disponível agora.",
-
-                "data": None,
-
-                "ranking":
-                    market.get(
-                        "ranking",
-                        [],
-                    ),
-
-                "approved":
-                    market.get(
-                        "approved",
-                        [],
-                    ),
-
-                "blocked":
-                    market.get(
-                        "blocked",
-                        [],
-                    ),
-            }
-
-        # ---------------------------------------------
-        # Horário
-        # ---------------------------------------------
-
-        entry_time = (
-            next_full_minute()
-        )
-
-        expiry_time = (
-            entry_time
-            + timedelta(
-                minutes=EXPIRY_MINUTES
-            )
-        )
-
-        # ---------------------------------------------
-        # Banco
-        # ---------------------------------------------
-
-        db_payload = (
-            build_db_payload(
-                best,
-                entry_time,
-                expiry_time,
-            )
-        )
-
-        saved = save_signal(
-            db_payload
-        )
-
-        if not saved:
-            raise RuntimeError(
-                "Supabase não confirmou "
-                "o salvamento do sinal."
-            )
-
-        saved_row = saved[0]
-
-        signal_id = (
-            saved_row.get("id")
-        )
-
-        # =============================================
-        # COOLDOWN
-        #
-        # SOMENTE AGORA.
-        #
-        # O sinal já foi realmente criado e salvo.
-        # =============================================
-
-        register_cooldown(
-            best["symbol"]
-        )
-
-        # ---------------------------------------------
-        # Response
-        # ---------------------------------------------
-
-        signal_data = (
-            build_api_signal(
-                best,
-                signal_id,
-                entry_time,
-                expiry_time,
-            )
-        )
-
+    if not best:
         return {
             "success": True,
-            "signal": True,
-
-            "message":
-                "Oportunidade encontrada.",
-
-            "data":
-                signal_data,
-
-            "ranking":
-                market.get(
-                    "ranking",
-                    [],
-                ),
-
-            "approved":
-                market.get(
-                    "approved",
-                    [],
-                ),
-
-            "blocked":
-                market.get(
-                    "blocked",
-                    [],
-                ),
+            "signal": False,
+            "message": "Nenhuma entrada A/A+ disponível agora.",
+            "data": None,
+            "ranking": market.get("ranking", []),
+            "approved": market.get("approved", []),
+            "blocked": market.get("blocked", []),
         }
 
-    except Exception as exc:
+    entry_time = next_full_minute()
+    expiry_time = entry_time + timedelta(minutes=EXPIRY_MINUTES)
 
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
+    db_payload = build_db_payload(
+        best,
+        entry_time,
+        expiry_time,
+    )
+
+    saved = save_signal(db_payload)
+
+    if not saved:
+        raise RuntimeError(
+            "Supabase não confirmou o salvamento do sinal."
         )
+
+    saved_row = saved[0]
+    signal_id = saved_row.get("id")
+
+    register_cooldown(best["symbol"])
+
+    signal_data = build_api_signal(
+        best,
+        signal_id,
+        entry_time,
+        expiry_time,
+    )
+
+    return {
+        "success": True,
+        "signal": True,
+        "message": "Oportunidade encontrada e salva no Supabase.",
+        "data": signal_data,
+        "ranking": market.get("ranking", []),
+        "approved": market.get("approved", []),
+        "blocked": market.get("blocked", []),
+    }
+
+
+if __name__ == "__main__":
+    import json
+
+    print("")
+    print("=" * 60)
+    print("BOOSTER LOCAL SIGNAL GENERATOR")
+    print("=" * 60)
+    print("Quotex local -> Scanner -> Supabase")
+    print("")
+
+    try:
+        result = generate_signal_local()
+        print(json.dumps(
+            result,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ))
+    except Exception as exc:
+        print(f"ERRO: {exc}")

@@ -1,47 +1,25 @@
 from __future__ import annotations
 
-import os
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, List
 
-import requests
-from dotenv import load_dotenv
 
 from database import supabase
+from quotex_feed import fetch_1m_quotex
 
 
 # =========================================================
 # BOOSTER ENTRY UPDATER V1.0
 # =========================================================
 
-UPDATER_VERSION = "1.0.0"
-
-load_dotenv()
+UPDATER_VERSION = "1.1.0"
 
 TZ = ZoneInfo("America/Sao_Paulo")
 
-API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-
-if not API_KEY:
-    raise RuntimeError(
-        "TWELVE_DATA_API_KEY não encontrada."
-    )
-
-TWELVE_DATA_URL = (
-    "https://api.twelvedata.com/time_series"
-)
-
-REQUEST_TIMEOUT = 30
-
-# Margem para o candle aparecer no REST
+# Margem para o candle aparecer no feed
 ENTRY_DELAY_SECONDS = 90
-
-# Mantemos abaixo do limite de 8/min.
-SAFE_REQUESTS_PER_MINUTE = 7
-
-request_timestamps: List[float] = []
 
 
 # =========================================================
@@ -60,141 +38,6 @@ def parse_datetime(value: str) -> datetime:
     return dt.astimezone(TZ)
 
 
-# =========================================================
-# RATE LIMIT
-# =========================================================
-
-def wait_for_local_quota():
-
-    global request_timestamps
-
-    now = time.time()
-
-    request_timestamps = [
-        ts
-        for ts in request_timestamps
-        if now - ts < 60
-    ]
-
-    if (
-        len(request_timestamps)
-        < SAFE_REQUESTS_PER_MINUTE
-    ):
-        return
-
-    oldest = min(request_timestamps)
-
-    wait_seconds = (
-        61 - (now - oldest)
-    )
-
-    if wait_seconds > 0:
-
-        print(
-            f"⏳ Quota local: "
-            f"aguardando {wait_seconds:.0f}s..."
-        )
-
-        time.sleep(wait_seconds)
-
-    now = time.time()
-
-    request_timestamps = [
-        ts
-        for ts in request_timestamps
-        if now - ts < 60
-    ]
-
-
-def register_request():
-
-    request_timestamps.append(
-        time.time()
-    )
-
-
-# =========================================================
-# TWELVE DATA
-# =========================================================
-
-def twelve_data_request(
-    params: Dict[str, Any],
-    retry_429: bool = True,
-) -> Dict[str, Any]:
-
-    wait_for_local_quota()
-
-    response = requests.get(
-        TWELVE_DATA_URL,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    register_request()
-
-    credits_used = response.headers.get(
-        "api-credits-used"
-    )
-
-    credits_left = response.headers.get(
-        "api-credits-left"
-    )
-
-    print(
-        f"   API credits | usados: "
-        f"{credits_used} | restantes: "
-        f"{credits_left}"
-    )
-
-    if response.status_code == 429:
-
-        if retry_429:
-
-            print(
-                "⏳ Limite atingido. "
-                "Aguardando reset..."
-            )
-
-            time.sleep(61)
-
-            return twelve_data_request(
-                params,
-                retry_429=False,
-            )
-
-        raise RuntimeError(
-            "Limite da Twelve Data "
-            "continua indisponível."
-        )
-
-    if not response.ok:
-
-        raise RuntimeError(
-            "Erro HTTP Twelve Data: "
-            f"{response.status_code}"
-        )
-
-    try:
-
-        payload = response.json()
-
-    except ValueError:
-
-        raise RuntimeError(
-            "Resposta inválida da Twelve Data."
-        )
-
-    if payload.get("status") == "error":
-
-        raise RuntimeError(
-            payload.get(
-                "message",
-                "Erro da Twelve Data.",
-            )
-        )
-
-    return payload
-
 
 # =========================================================
 # PREÇO REAL DE ENTRADA
@@ -204,14 +47,12 @@ def get_entry_price(
     symbol: str,
     entry_time: datetime,
 ) -> Optional[float]:
-
     """
-    Se o Booster informou entrada às 21:15:00,
-    buscamos especificamente o candle 1M iniciado
-    às 21:15.
+    Usa o feed da Quotex.
 
-    O OPEN desse candle será usado como preço
-    de referência da entrada.
+    Se o Booster informou entrada às 21:15:00,
+    procura o candle M1 iniciado às 21:15 e usa
+    o OPEN desse candle como preço de referência.
     """
 
     target_minute = entry_time.replace(
@@ -219,93 +60,31 @@ def get_entry_price(
         microsecond=0,
     )
 
-    start_date = (
-        target_minute
-        - timedelta(minutes=1)
+    # O feed já mantém cache local; pedimos uma janela suficiente
+    # para localizar entradas pendentes recentes.
+    candles = fetch_1m_quotex(
+        symbol=symbol,
+        candle_count=2500,
     )
 
-    end_date = (
-        target_minute
-        + timedelta(minutes=2)
-    )
-
-    params = {
-        "symbol": symbol,
-        "interval": "1min",
-
-        "start_date":
-            start_date.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-
-        "end_date":
-            end_date.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-
-        "timezone":
-            "America/Sao_Paulo",
-
-        "apikey":
-            API_KEY,
-
-        "format":
-            "JSON",
-    }
-
-    payload = twelve_data_request(
-        params
-    )
-
-    values = payload.get(
-        "values",
-        []
-    )
-
-    for candle in values:
-
-        raw_datetime = candle.get(
-            "datetime"
-        )
+    for candle in candles:
+        raw_datetime = candle.get("datetime")
 
         if not raw_datetime:
             continue
 
-        candle_dt = datetime.fromisoformat(
-            raw_datetime
-        )
-
-        if candle_dt.tzinfo is None:
-            candle_dt = candle_dt.replace(
-                tzinfo=TZ
-            )
-
-        candle_dt = (
-            candle_dt
-            .astimezone(TZ)
-            .replace(
-                second=0,
-                microsecond=0,
-            )
+        candle_dt = parse_datetime(str(raw_datetime)).replace(
+            second=0,
+            microsecond=0,
         )
 
         if candle_dt == target_minute:
-
             try:
-
-                return float(
-                    candle["open"]
-                )
-
-            except (
-                KeyError,
-                TypeError,
-                ValueError,
-            ):
+                return float(candle["open"])
+            except (KeyError, TypeError, ValueError):
                 return None
 
     return None
-
 
 # =========================================================
 # BUSCAR SINAIS QUE PRECISAM DE CORREÇÃO

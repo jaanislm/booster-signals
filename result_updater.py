@@ -1,49 +1,25 @@
 from __future__ import annotations
 
-import os
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, List
 
-import requests
-from dotenv import load_dotenv
 
 from database import supabase
+from quotex_feed import fetch_1m_quotex
 
 
 # =========================================================
 # BOOSTER RESULT UPDATER V1.1
 # =========================================================
 
-UPDATER_VERSION = "1.1.0"
-
-load_dotenv()
+UPDATER_VERSION = "1.2.0"
 
 TZ = ZoneInfo("America/Sao_Paulo")
 
-API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-
-if not API_KEY:
-    raise RuntimeError(
-        "TWELVE_DATA_API_KEY não encontrada."
-    )
-
-TWELVE_DATA_URL = (
-    "https://api.twelvedata.com/time_series"
-)
-
-# Twelve Data Basic
-SAFE_REQUESTS_PER_MINUTE = 7
-
-# O REST pode demorar para disponibilizar candle fechado.
-# Vamos esperar pelo menos 2 minutos após a expiração.
+# Aguarda o candle de expiração estar fechado/disponível.
 RESULT_DELAY_SECONDS = 120
-
-REQUEST_TIMEOUT = 30
-
-# Controle local
-request_timestamps: List[float] = []
 
 
 # =========================================================
@@ -62,161 +38,6 @@ def parse_datetime(value: str) -> datetime:
     return dt.astimezone(TZ)
 
 
-# =========================================================
-# RATE LIMIT LOCAL
-# =========================================================
-
-def wait_for_local_quota():
-
-    global request_timestamps
-
-    now = time.time()
-
-    # Mantém apenas chamadas feitas nos últimos 60s
-    request_timestamps = [
-        timestamp
-        for timestamp in request_timestamps
-        if now - timestamp < 60
-    ]
-
-    if (
-        len(request_timestamps)
-        < SAFE_REQUESTS_PER_MINUTE
-    ):
-        return
-
-    oldest = min(request_timestamps)
-
-    wait_seconds = (
-        61 - (now - oldest)
-    )
-
-    if wait_seconds > 0:
-
-        print(
-            f"⏳ Quota local: aguardando "
-            f"{wait_seconds:.0f}s..."
-        )
-
-        time.sleep(wait_seconds)
-
-    now = time.time()
-
-    request_timestamps = [
-        timestamp
-        for timestamp in request_timestamps
-        if now - timestamp < 60
-    ]
-
-
-def register_request():
-
-    request_timestamps.append(
-        time.time()
-    )
-
-
-# =========================================================
-# TWELVE DATA REQUEST
-# =========================================================
-
-def twelve_data_request(
-    params: Dict[str, Any],
-    retry_429: bool = True,
-) -> Dict[str, Any]:
-
-    wait_for_local_quota()
-
-    response = requests.get(
-        TWELVE_DATA_URL,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    register_request()
-
-    # -----------------------------------------------------
-    # Headers de quota
-    # -----------------------------------------------------
-
-    credits_used = response.headers.get(
-        "api-credits-used"
-    )
-
-    credits_left = response.headers.get(
-        "api-credits-left"
-    )
-
-    if (
-        credits_used is not None
-        or credits_left is not None
-    ):
-        print(
-            "   API credits"
-            f" | usados: {credits_used}"
-            f" | restantes: {credits_left}"
-        )
-
-    # -----------------------------------------------------
-    # 429
-    # -----------------------------------------------------
-
-    if response.status_code == 429:
-
-        if retry_429:
-
-            print(
-                "⏳ Limite da Twelve Data atingido. "
-                "Aguardando reset..."
-            )
-
-            time.sleep(61)
-
-            return twelve_data_request(
-                params,
-                retry_429=False,
-            )
-
-        raise RuntimeError(
-            "Limite da Twelve Data continua "
-            "indisponível após o reset."
-        )
-
-    # -----------------------------------------------------
-    # Outros HTTP errors
-    #
-    # Não usamos raise_for_status() para evitar
-    # imprimir URL contendo a API KEY.
-    # -----------------------------------------------------
-
-    if not response.ok:
-
-        raise RuntimeError(
-            "Erro HTTP da Twelve Data: "
-            f"{response.status_code}"
-        )
-
-    try:
-
-        payload = response.json()
-
-    except ValueError:
-
-        raise RuntimeError(
-            "Resposta inválida da Twelve Data."
-        )
-
-    if payload.get("status") == "error":
-
-        raise RuntimeError(
-            payload.get(
-                "message",
-                "Erro retornado pela Twelve Data.",
-            )
-        )
-
-    return payload
-
 
 # =========================================================
 # EXPIRY PRICE
@@ -226,120 +47,44 @@ def get_expiry_price(
     symbol: str,
     expiry_time: datetime,
 ) -> Optional[float]:
-
     """
-    Para uma expiração às 15:10:
+    Usa o feed da Quotex.
 
-    buscamos o candle 1M iniciado às 15:09.
-
-    O CLOSE desse candle representa o preço
-    imediatamente anterior à virada para 15:10.
+    Para uma expiração às 15:10, procura o candle M1
+    iniciado às 15:09. O CLOSE desse candle representa
+    o preço imediatamente anterior à expiração.
     """
 
     target_minute = (
-        expiry_time
-        - timedelta(minutes=1)
+        expiry_time - timedelta(minutes=1)
     ).replace(
         second=0,
         microsecond=0,
     )
 
-    start_date = (
-        target_minute
-        - timedelta(minutes=2)
+    candles = fetch_1m_quotex(
+        symbol=symbol,
+        candle_count=2500,
     )
 
-    end_date = (
-        target_minute
-        + timedelta(minutes=2)
-    )
-
-    params = {
-        "symbol": symbol,
-        "interval": "1min",
-
-        "start_date":
-            start_date.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-
-        "end_date":
-            end_date.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-
-        "timezone":
-            "America/Sao_Paulo",
-
-        "apikey":
-            API_KEY,
-
-        "format":
-            "JSON",
-    }
-
-    payload = twelve_data_request(
-        params
-    )
-
-    values = payload.get(
-        "values",
-        []
-    )
-
-    if not values:
-        return None
-
-    # =====================================================
-    # IMPORTANTE:
-    # Não pegamos simplesmente "o mais próximo".
-    #
-    # Queremos especificamente o candle correspondente
-    # ao minuto da expiração.
-    # =====================================================
-
-    for candle in values:
-
-        raw_datetime = candle.get(
-            "datetime"
-        )
+    for candle in candles:
+        raw_datetime = candle.get("datetime")
 
         if not raw_datetime:
             continue
 
-        candle_dt = datetime.fromisoformat(
-            raw_datetime
-        )
-
-        if candle_dt.tzinfo is None:
-            candle_dt = candle_dt.replace(
-                tzinfo=TZ
-            )
-
-        candle_dt = candle_dt.astimezone(
-            TZ
-        ).replace(
+        candle_dt = parse_datetime(str(raw_datetime)).replace(
             second=0,
             microsecond=0,
         )
 
         if candle_dt == target_minute:
-
             try:
-
-                return float(
-                    candle["close"]
-                )
-
-            except (
-                KeyError,
-                TypeError,
-                ValueError,
-            ):
+                return float(candle["close"])
+            except (KeyError, TypeError, ValueError):
                 return None
 
     return None
-
 
 # =========================================================
 # RESULT
@@ -654,8 +399,7 @@ def update_pending_results():
 
         except Exception as exc:
 
-            # Não imprime URL/request.
-            # Assim não vazamos a API key.
+            # Mantemos o erro resumido no log.
 
             error = {
                 "id":
